@@ -307,6 +307,45 @@ serving piloted clients but not yet advertising itself (discovery still 404s).
 It is a temporary escape hatch for that dark pilot, not a configuration
 surface, and will be removed once the server advertises its metadata.
 
+### OAuth behind a proxy
+
+OAuth requests, such as login, token refresh, and logout, connect directly
+and refuse private and special-use addresses, so a stored or advertised
+endpoint cannot send a token into your network. Two variables relax that
+check. Both are off by default.
+
+| Variable | Effect |
+|----------|--------|
+| `BASECAMP_OAUTH_USE_PROXY` | `1` sends OAuth requests through `HTTP_PROXY` or `HTTPS_PROXY` without the address check. Requests that `NO_PROXY` excludes keep the check. Any other value is ignored with a warning. |
+| `BASECAMP_OAUTH_PROXY_CIDRS` | Comma-separated CIDR prefixes that your DNS proxy answers with. OAuth connections to those prefixes skip the address check. |
+
+Without `BASECAMP_OAUTH_USE_PROXY=1`, OAuth requests ignore `HTTP_PROXY` and
+`HTTPS_PROXY`, connect directly, and print a warning.
+
+Some networks run a transparent DNS proxy. DNS for `launchpad.37signals.com`
+returns a placeholder such as `198.18.0.1`, and the proxy carries the
+connection to the real host. `curl https://launchpad.37signals.com` still
+works, but `basecamp auth refresh` fails with "resolves to an address refused
+by the address policy", because `198.18.0.0/15` is special-use space. If you
+know that your resolver answers proxied names from that range, set the
+variable to the prefix your proxy uses:
+
+```bash
+export BASECAMP_OAUTH_PROXY_CIDRS=198.18.0.0/15
+```
+
+The CLI then skips the address check for those prefixes, and your proxy
+judges the real target. Until surfguard can admit a prefix ahead of its
+special-use tables, the variable also stops blocking AS112
+(`192.31.196.0/24`, `192.175.48.0/24`, `2001:4:112::/48`,
+`2620:4f:8000::/48`), AMT (`192.52.193.0/24`, `2001:3::/32`), and the NAT64
+well-known prefix `64:ff9b::/96`. The CLI then judges a NAT64 address by the
+IPv4 address it embeds. Private addresses, such as RFC 1918 and CGNAT (`100.64.0.0/10`), stay
+blocked unless you list them. A prefix that does not parse, or that overlaps
+loopback, link-local, unspecified, multicast, or IPv4-mapped space, turns the
+whole variable off with a warning. While the variable is on, each command
+that makes an OAuth request prints a warning.
+
 ## AI Agent Integration
 
 `basecamp` works with any AI agent that can run shell commands.
