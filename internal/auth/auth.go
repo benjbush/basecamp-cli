@@ -104,6 +104,18 @@ type Manager struct {
 	// traffic, a malformed opt-out value). Test seam; nil means stderr.
 	Warnf func(format string, args ...any)
 
+	// launchpadLookup answers DNS for the Launchpad lane's anchor dialer.
+	// Nil uses net.DefaultResolver. Tests pin answers so the benchmarking
+	// range carve-out can be judged without the network. The BC5 lane does
+	// not consult it.
+	launchpadLookup launchpadLookup
+
+	// launchpadConnect opens a TCP connection the Launchpad dialer has
+	// already admitted under its control. Nil uses net.Dialer with that
+	// same control. Tests record the admission and return without a socket.
+	// A refused control never reaches it. The BC5 lane does not consult it.
+	launchpadConnect launchpadConnectFunc
+
 	// clock is the time a remembered mint verdict is read and written
 	// against (renewal_hold.go). Test seam; nil means time.Now.
 	clock func() time.Time

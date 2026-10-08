@@ -307,6 +307,18 @@ serving piloted clients but not yet advertising itself (discovery still 404s).
 It is a temporary escape hatch for that dark pilot, not a configuration
 surface, and will be removed once the server advertises its metadata.
 
+Token refresh refuses to send a refresh token to a private or special-use
+address: loopback, RFC 1918, link-local, CGNAT (`100.64.0.0/10`), metadata,
+documentation ranges, and the rest of the IANA special-purpose registry.
+Some transparent proxies answer DNS for the host they intercept with the
+RFC 2544 benchmarking range `198.18.0.0/15` (often `198.18.0.1`) while HTTPS
+through the proxy still reaches the real service. Refresh to the Launchpad
+anchor — `https://launchpad.37signals.com`, or whatever host
+`BASECAMP_LAUNCHPAD_URL` names — is allowed when every address that name
+resolves to is inside that range and would be refused only for that reason.
+Any other host, a literal address, a mixed answer, or a genuinely private
+address stays refused. The check is not disabled globally.
+
 ## AI Agent Integration
 
 `basecamp` works with any AI agent that can run shell commands.

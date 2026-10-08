@@ -58,6 +58,16 @@ func checkAuthClientRedirect(_ *http.Request, via []*http.Request) error {
 // admission must not leak to the other lane (a localhost Launchpad override
 // must not let production BC5 metadata name a loopback token endpoint).
 //
+// The policy keeps IANA special-use protection, which refuses RFC 2544's
+// benchmarking range 198.18.0.0/15. Allow cannot put that range back: the
+// special-use tables outrank it. Some transparent proxies publish an address
+// in that range (usually 198.18.0.1) as the DNS answer for the host they
+// intercept, while HTTPS still reaches the real service. The Launchpad lane
+// carves the range back out at dial time, and only then — see
+// dialLaunchpadAnchor. The carve-out is not applied here, and it is not
+// applied to the BC5 lane. BASECAMP_OAUTH_USE_PROXY is unrelated: it skips
+// address enforcement only when HTTP(S)_PROXY actually routes the request.
+//
 // The label names the anchor in errors without echoing its value: anchor URLs
 // can arrive via environment overrides, and parse failures can reproduce
 // their input.
@@ -253,7 +263,7 @@ func (m *Manager) bc5Client() (*http.Client, error) {
 		return m.httpClient, nil
 	}
 	m.bc5Lane.once.Do(func() {
-		m.bc5Lane.client, m.bc5Lane.err = m.buildLaneClient(m.cfg.BaseURL, "base URL")
+		m.bc5Lane.client, m.bc5Lane.err = m.buildLaneClient(m.cfg.BaseURL, "base URL", false)
 	})
 	return m.bc5Lane.client, m.bc5Lane.err
 }
@@ -272,19 +282,23 @@ func (m *Manager) launchpadClient() (*http.Client, error) {
 			m.lpLane.err = err
 			return
 		}
-		m.lpLane.client, m.lpLane.err = m.buildLaneClient(lpURL, "Launchpad URL")
+		m.lpLane.client, m.lpLane.err = m.buildLaneClient(lpURL, "Launchpad URL", true)
 	})
 	return m.lpLane.client, m.lpLane.err
 }
 
-func (m *Manager) buildLaneClient(anchorURL, label string) (*http.Client, error) {
+func (m *Manager) buildLaneClient(anchorURL, label string, launchpadAnchor bool) (*http.Client, error) {
 	policy, err := oauthEndpointPolicy(anchorURL, label)
 	if err != nil {
 		return nil, err
 	}
+	guarded := policy.RoundTripper()
+	if launchpadAnchor {
+		guarded = m.launchpadGuardedTransport(policy, anchorURL)
+	}
 	st := m.proxyState()
 	tr := &oauthTransport{
-		guarded: policy.RoundTripper(),
+		guarded: guarded,
 		resolve: st.resolve,
 		optOut:  st.optOut,
 		warnf:   m.warnf,
