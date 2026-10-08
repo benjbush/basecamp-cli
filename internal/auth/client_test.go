@@ -594,6 +594,45 @@ func TestExchangeCode_PreservesSDKErrorTaxonomy(t *testing.T) {
 	assert.True(t, strings.HasPrefix(cliErr.Message, "token exchange failed: "))
 }
 
+// TestRefreshLocked_ProxyCIDRsAdmitTheProxyAddress: a transparent DNS proxy
+// answers with an address in 198.18.0.0/15. Without the opt-in the refresh is
+// refused before any connection. With the proxy's prefix named, the refresh
+// is sent; nothing answers here, so it fails as an ordinary connection.
+func TestRefreshLocked_ProxyCIDRsAdmitTheProxyAddress(t *testing.T) {
+	refresh := func(t *testing.T) error {
+		t.Helper()
+		m := laneManager(t, "https://3.basecampapi.com")
+		m.Warnf = func(string, ...any) {}
+		creds := &Credentials{
+			AccessToken:   "stale",
+			RefreshToken:  "refresh-token",
+			OAuthType:     oauthTypeLaunchpad,
+			TokenEndpoint: "https://198.18.0.1/authorization/token",
+		}
+		require.NoError(t, m.store.Save("https://3.basecampapi.com", creds))
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		return m.refreshLocked(ctx, "https://3.basecampapi.com", creds)
+	}
+
+	t.Run("unset: refused by the address policy", func(t *testing.T) {
+		clearProxyEnv(t)
+		t.Setenv("BASECAMP_OAUTH_PROXY_CIDRS", "")
+		assert.ErrorIs(t, refresh(t), surfguard.ErrBlocked)
+	})
+
+	t.Run("set: sent, and fails as an ordinary connection", func(t *testing.T) {
+		clearProxyEnv(t)
+		t.Setenv("BASECAMP_OAUTH_PROXY_CIDRS", "198.18.0.0/15")
+		err := refresh(t)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, surfguard.ErrBlocked), "refused by the address policy: %v", err)
+		var urlErr *url.Error
+		require.ErrorAs(t, err, &urlErr)
+		assert.Equal(t, "https://198.18.0.1/authorization/token", urlErr.URL)
+	})
+}
+
 // TestRefreshLocked_RedirectStatusSurvives asserts a refused token-endpoint
 // redirect reaches the caller as a typed error carrying the 3xx status.
 func TestRefreshLocked_RedirectStatusSurvives(t *testing.T) {
