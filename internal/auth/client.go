@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -25,6 +27,56 @@ import (
 // be told apart from intent. Any other non-empty value is refused with a
 // warning rather than guessed at.
 const oauthUseProxyEnv = "BASECAMP_OAUTH_USE_PROXY"
+
+// oauthProxyCIDRsEnv names, as comma-separated CIDR prefixes, the addresses
+// the operator's transparent DNS proxy answers with for the names it
+// intercepts (198.18.0.1 for launchpad.37signals.com, say). OAuth
+// connections to those prefixes reach the proxy, which judges the real
+// target, so the lanes stop checking them. Set-but-empty is unset, silently,
+// for the same reason as oauthUseProxyEnv.
+const oauthProxyCIDRsEnv = "BASECAMP_OAUTH_PROXY_CIDRS"
+
+// unproxiableSpace is address space no DNS proxy answers with. A prefix that
+// reaches into it is a mistake, and honoring it would expose the host's own
+// services or a cloud metadata endpoint to OAuth requests.
+var unproxiableSpace = []struct {
+	name   string
+	prefix netip.Prefix
+}{
+	{"loopback", netip.MustParsePrefix("127.0.0.0/8")},
+	{"loopback", netip.MustParsePrefix("::1/128")},
+	{"link-local", netip.MustParsePrefix("169.254.0.0/16")},
+	{"link-local", netip.MustParsePrefix("fe80::/10")},
+	{"unspecified", netip.MustParsePrefix("0.0.0.0/32")},
+	{"unspecified", netip.MustParsePrefix("::/128")},
+	{"multicast", netip.MustParsePrefix("224.0.0.0/4")},
+	{"multicast", netip.MustParsePrefix("ff00::/8")},
+	{"IPv4-mapped", netip.MustParsePrefix("::ffff:0:0/96")},
+}
+
+// parseProxyCIDRs reads an oauthProxyCIDRsEnv value. One bad prefix refuses
+// the whole value rather than running a shorter list than the operator wrote.
+func parseProxyCIDRs(v string) ([]netip.Prefix, error) {
+	if v == "" {
+		return nil, nil
+	}
+	var prefixes []netip.Prefix
+	for _, field := range strings.Split(v, ",") {
+		field = strings.TrimSpace(field)
+		prefix, err := netip.ParsePrefix(field)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a CIDR prefix", field)
+		}
+		prefix = prefix.Masked()
+		for _, space := range unproxiableSpace {
+			if prefix.Overlaps(space.prefix) {
+				return nil, fmt.Errorf("%s overlaps %s space %s", prefix, space.name, space.prefix)
+			}
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
 
 // oauthClientTimeout bounds each OAuth HTTP request on the lane clients —
 // the same 30s the pre-lane appctx client carried.
@@ -58,15 +110,23 @@ func checkAuthClientRedirect(_ *http.Request, via []*http.Request) error {
 // admission must not leak to the other lane (a localhost Launchpad override
 // must not let production BC5 metadata name a loopback token endpoint).
 //
+// proxyPrefixes are the operator's oauthProxyCIDRsEnv prefixes. Naming any
+// swaps the SDK default for the same policy without its IANA special-use
+// tables, because Allow cannot re-admit special-use space and 198.18.0.0/15,
+// the placeholder range proxies use most, is in those tables.
+//
 // The label names the anchor in errors without echoing its value: anchor URLs
 // can arrive via environment overrides, and parse failures can reproduce
 // their input.
-func oauthEndpointPolicy(anchorURL, label string) (surfguard.Policy, error) {
+func oauthEndpointPolicy(anchorURL, label string, proxyPrefixes []netip.Prefix) (surfguard.Policy, error) {
 	u, err := url.Parse(anchorURL)
 	if err != nil || u.Opaque != "" || !u.IsAbs() || u.Hostname() == "" {
 		return surfguard.Policy{}, output.ErrAuth(fmt.Sprintf("invalid %s: must be an absolute URL with a hostname", label))
 	}
 	policy := oauth.DefaultIssuerPolicy()
+	if len(proxyPrefixes) > 0 {
+		policy = surfguard.Policy{}.AllowAllPorts().Allow(proxyPrefixes...)
+	}
 	// IsLocalhost matches a host[:port] string case-sensitively; DNS names
 	// are case-insensitive, so lowercase first — the same normalization
 	// resourceOrigin and isSecureEndpointURL apply.
@@ -77,14 +137,16 @@ func oauthEndpointPolicy(anchorURL, label string) (surfguard.Policy, error) {
 }
 
 // proxyEnvState is the Manager's one construction-time snapshot of the proxy
-// environment: the resolver both lanes route and warn against, and whether
+// environment: the resolver both lanes route and warn against, whether
 // the operator opted OAuth traffic out of address enforcement when a proxy
-// applies. Snapshotting once keeps routing and warnings from ever
+// applies, and the prefixes the operator's DNS proxy answers with.
+// Snapshotting once keeps routing and warnings from ever
 // disagreeing — http.ProxyFromEnvironment caches process-globally on its own
 // schedule and could diverge from a second FromEnvironment read.
 type proxyEnvState struct {
-	resolve func(*url.URL) (*url.URL, error)
-	optOut  bool
+	resolve       func(*url.URL) (*url.URL, error)
+	optOut        bool
+	proxyPrefixes []netip.Prefix
 }
 
 func (m *Manager) proxyState() *proxyEnvState {
@@ -102,6 +164,21 @@ func (m *Manager) proxyState() *proxyEnvState {
 			// silently ignoring it would leave the operator believing they
 			// opted out.
 			m.warnf("warning: %s=%q is not understood (only \"1\" enables it); OAuth requests keep the SSRF address policy", oauthUseProxyEnv, v)
+		}
+		switch prefixes, err := parseProxyCIDRs(os.Getenv(oauthProxyCIDRsEnv)); {
+		case err != nil:
+			m.warnf("warning: ignoring %s: %v; OAuth requests keep the SSRF address policy", oauthProxyCIDRsEnv, err)
+		case prefixes != nil:
+			st.proxyPrefixes = prefixes
+			names := make([]string, len(prefixes))
+			for i, p := range prefixes {
+				names[i] = p.String()
+			}
+			m.warnf("warning: OAuth connections to %s are treated as your network's proxy and are not address-checked (%s). "+
+				"Until surfguard can admit a prefix ahead of its special-use tables, this also stops blocking "+
+				"AS112 (192.31.196.0/24, 192.175.48.0/24, 2001:4:112::/48, 2620:4f:8000::/48), AMT (192.52.193.0/24, 2001:3::/32), "+
+				"and the NAT64 well-known prefix 64:ff9b::/96, which is then judged by its embedded IPv4 address",
+				strings.Join(names, ", "), oauthProxyCIDRsEnv)
 		}
 		m.proxyEnv = st
 	})
@@ -278,11 +355,11 @@ func (m *Manager) launchpadClient() (*http.Client, error) {
 }
 
 func (m *Manager) buildLaneClient(anchorURL, label string) (*http.Client, error) {
-	policy, err := oauthEndpointPolicy(anchorURL, label)
+	st := m.proxyState()
+	policy, err := oauthEndpointPolicy(anchorURL, label, st.proxyPrefixes)
 	if err != nil {
 		return nil, err
 	}
-	st := m.proxyState()
 	tr := &oauthTransport{
 		guarded: policy.RoundTripper(),
 		resolve: st.resolve,
@@ -309,6 +386,9 @@ func (m *Manager) buildLaneClient(anchorURL, label string) (*http.Client, error)
 func wrapOAuthError(op string, err error) error {
 	e := *output.AsError(err)
 	e.Message = op + ": " + e.Message
+	if errors.Is(err, surfguard.ErrBlocked) {
+		e.Hint = "If your network's DNS proxy answers with placeholder addresses, set " + oauthProxyCIDRsEnv + " to the prefix it uses"
+	}
 	e.Cause = err
 	return &e
 }
