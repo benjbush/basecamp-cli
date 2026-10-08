@@ -28,7 +28,7 @@ import (
 // need a proxy set their own values on top.
 func clearProxyEnv(t *testing.T) {
 	t.Helper()
-	for _, v := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD", oauthUseProxyEnv} {
+	for _, v := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD", oauthUseProxyEnv, oauthProxyCIDRsEnv} {
 		t.Setenv(v, "")
 	}
 }
@@ -52,6 +52,21 @@ func doGet(t *testing.T, client *http.Client, rawURL string) (*http.Response, er
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
 	require.NoError(t, err)
 	return client.Do(req)
+}
+
+// getWithin issues a GET that gives up after d, for targets nothing may
+// answer, and returns only its error.
+func getWithin(t *testing.T, client *http.Client, rawURL string, d time.Duration) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	return err
 }
 
 // TestCheckAuthClientRedirect_StopsLoop verifies the lane clients' redirect
@@ -90,7 +105,8 @@ func TestCheckAuthClientRedirect_BlocksCredentialPOST(t *testing.T) {
 
 // TestOAuthEndpointPolicy_LoopbackDerivation drives the policy derivation
 // through hostutil's host handling: loopback admission must key off the
-// lowercased host of a parsed URL, for every spelling of "local".
+// lowercased host of a parsed URL, for every spelling of "local", whether or
+// not the operator named a proxy prefix.
 func TestOAuthEndpointPolicy_LoopbackDerivation(t *testing.T) {
 	loopback := netip.MustParseAddr("127.0.0.1")
 
@@ -116,20 +132,66 @@ func TestOAuthEndpointPolicy_LoopbackDerivation(t *testing.T) {
 		{"opaque form", "https:foo", true, false},
 		{"hostless", "https://", true, false},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			policy, err := oauthEndpointPolicy(tc.anchor, "base URL")
-			if tc.wantErr {
-				require.Error(t, err)
-				if tc.anchor != "" {
-					assert.NotContains(t, err.Error(), tc.anchor, "errors must not echo the anchor value")
+	for _, proxyPrefixes := range [][]netip.Prefix{nil, {netip.MustParsePrefix("198.18.0.0/15")}} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s, proxy prefixes %v", tc.name, proxyPrefixes), func(t *testing.T) {
+				policy, err := oauthEndpointPolicy(tc.anchor, "base URL", proxyPrefixes)
+				if tc.wantErr {
+					require.Error(t, err)
+					if tc.anchor != "" {
+						assert.NotContains(t, err.Error(), tc.anchor, "errors must not echo the anchor value")
+					}
+					return
 				}
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, !tc.allowLoopback, policy.Blocked(loopback),
-				"loopback admission for %q", tc.anchor)
-		})
+				require.NoError(t, err)
+				assert.Equal(t, !tc.allowLoopback, policy.Blocked(loopback),
+					"loopback admission for %q", tc.anchor)
+			})
+		}
+	}
+}
+
+// TestOAuthEndpointPolicy_ProxyPrefixes: naming the proxy's prefix admits
+// that prefix and nothing else a production anchor refuses.
+func TestOAuthEndpointPolicy_ProxyPrefixes(t *testing.T) {
+	proxy := []netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")}
+
+	policy, err := oauthEndpointPolicy("https://launchpad.37signals.com", "Launchpad URL", proxy)
+	require.NoError(t, err)
+	assert.False(t, policy.Blocked(netip.MustParseAddr("198.18.0.1")))
+	for _, addr := range []string{"10.0.0.1", "172.16.0.1", "192.168.1.1", "127.0.0.1", "169.254.169.254", "100.64.0.1", "168.63.129.16", "fc00::1", "fe80::1"} {
+		assert.True(t, policy.Blocked(netip.MustParseAddr(addr)), addr)
+	}
+
+	policy, err = oauthEndpointPolicy("https://launchpad.37signals.com", "Launchpad URL", nil)
+	require.NoError(t, err)
+	assert.True(t, policy.Blocked(netip.MustParseAddr("198.18.0.1")))
+}
+
+// TestOAuthEndpointPolicy_ProxyBaseMatchesSDKDefault: the opt-in rebuilds
+// the SDK default without its special-use tables. A rule the SDK adds to its
+// default fails here instead of going missing from the opt-in.
+func TestOAuthEndpointPolicy_ProxyBaseMatchesSDKDefault(t *testing.T) {
+	assert.Equal(t, surfguard.Policy{}.IANASpecialUse().AllowAllPorts(), oauth.DefaultIssuerPolicy())
+}
+
+func TestParseProxyCIDRs(t *testing.T) {
+	prefixes, err := parseProxyCIDRs("")
+	require.NoError(t, err)
+	assert.Nil(t, prefixes)
+
+	prefixes, err = parseProxyCIDRs("198.18.0.0/15")
+	require.NoError(t, err)
+	assert.Equal(t, []netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")}, prefixes)
+
+	prefixes, err = parseProxyCIDRs("10.0.0.0/8, 100.64.0.0/10")
+	require.NoError(t, err)
+	assert.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10")}, prefixes)
+
+	for _, v := range []string{"yes", "127.0.0.0/8", "169.254.0.0/16"} {
+		prefixes, err := parseProxyCIDRs(v)
+		require.Error(t, err, v)
+		assert.Nil(t, prefixes, v)
 	}
 }
 
@@ -488,6 +550,72 @@ func TestOptOutMode_MalformedValuesAreOffWithWarning(t *testing.T) {
 	})
 }
 
+// TestProxyCIDRs_BothLanesAdmitTheProxyPrefix: every OAuth request rides
+// one of the two lanes, so both admit the named prefix, and the operator
+// hears about the opt-in once, not once per lane.
+func TestProxyCIDRs_BothLanesAdmitTheProxyPrefix(t *testing.T) {
+	for _, set := range []bool{false, true} {
+		t.Run(fmt.Sprintf("set=%v", set), func(t *testing.T) {
+			clearProxyEnv(t)
+			if set {
+				t.Setenv(oauthProxyCIDRsEnv, "198.18.0.0/15")
+			}
+
+			var warnings []string
+			m := laneManager(t, "https://3.basecampapi.com")
+			m.Warnf = func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }
+
+			for name, lane := range map[string]func() (*http.Client, error){"BC5": m.bc5Client, "Launchpad": m.launchpadClient} {
+				client, err := lane()
+				require.NoError(t, err)
+				err = getWithin(t, client, "https://198.18.0.1/token", 500*time.Millisecond)
+				require.Error(t, err, name)
+				assert.Equal(t, !set, errors.Is(err, surfguard.ErrBlocked), "%s lane: %v", name, err)
+			}
+
+			if !set {
+				assert.Empty(t, warnings)
+				return
+			}
+			require.Len(t, warnings, 1)
+			assert.Contains(t, warnings[0], "OAuth connections to 198.18.0.0/15 are treated as your network's proxy")
+			assert.Contains(t, warnings[0], oauthProxyCIDRsEnv)
+		})
+	}
+}
+
+// TestProxyCIDRs_RefusedValuesLeaveTheFeatureOff: a value that does not
+// parse, or that reaches into space no proxy answers with, is ignored with
+// a warning, and every address keeps the full policy, including any good
+// prefix listed beside the bad one.
+func TestProxyCIDRs_RefusedValuesLeaveTheFeatureOff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	cases := []struct{ value, target string }{
+		{"yes", "https://198.18.0.1/token"},
+		{"127.0.0.0/8", srv.URL},
+		{"169.254.0.0/16", "http://169.254.169.254/latest/meta-data"},
+		{"198.18.0.0/15,127.0.0.0/8", "https://198.18.0.1/token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			clearProxyEnv(t)
+			t.Setenv(oauthProxyCIDRsEnv, tc.value)
+
+			var warnings []string
+			m := laneManager(t, "https://3.basecampapi.com")
+			m.Warnf = func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }
+
+			client, err := m.launchpadClient()
+			require.NoError(t, err)
+			assert.ErrorIs(t, getWithin(t, client, tc.target, 2*time.Second), surfguard.ErrBlocked)
+			require.Len(t, warnings, 1)
+			assert.Contains(t, warnings[0], "warning: ignoring "+oauthProxyCIDRsEnv)
+		})
+	}
+}
+
 // TestDiscoverOAuth_LocalIssuerChainFollowsBaseURL is the end-to-end
 // provenance test for discovery: a local resource advertising a local issuer
 // succeeds under a local base URL (the lane's AllowLoopback covers hop 2 via
@@ -592,6 +720,51 @@ func TestExchangeCode_PreservesSDKErrorTaxonomy(t *testing.T) {
 	require.ErrorAs(t, err, &cliErr)
 	assert.Equal(t, sdkErr.Code, cliErr.Code)
 	assert.True(t, strings.HasPrefix(cliErr.Message, "token exchange failed: "))
+}
+
+// TestRefreshLocked_ProxyCIDRsAdmitTheProxyAddress: a transparent DNS proxy
+// answers with an address in 198.18.0.0/15. Without the opt-in the refresh is
+// refused before any connection, and the hint names the variable but no
+// prefix, because the refused address may be genuinely private. With the
+// proxy's prefix named, the refresh is sent. Nothing answers here, so it
+// fails as an ordinary connection.
+func TestRefreshLocked_ProxyCIDRsAdmitTheProxyAddress(t *testing.T) {
+	refresh := func(t *testing.T) error {
+		t.Helper()
+		m := laneManager(t, "https://3.basecampapi.com")
+		m.Warnf = func(string, ...any) {}
+		creds := &Credentials{
+			AccessToken:   "stale",
+			RefreshToken:  "refresh-token",
+			OAuthType:     oauthTypeLaunchpad,
+			TokenEndpoint: "https://198.18.0.1/authorization/token",
+		}
+		require.NoError(t, m.store.Save("https://3.basecampapi.com", creds))
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		return m.refreshLocked(ctx, "https://3.basecampapi.com", creds)
+	}
+
+	t.Run("unset: refused by the address policy", func(t *testing.T) {
+		clearProxyEnv(t)
+		err := refresh(t)
+		assert.ErrorIs(t, err, surfguard.ErrBlocked)
+		var cliErr *output.Error
+		require.ErrorAs(t, err, &cliErr)
+		assert.Contains(t, cliErr.Hint, "BASECAMP_OAUTH_PROXY_CIDRS")
+		assert.NotContains(t, cliErr.Hint, "198.18")
+	})
+
+	t.Run("set: sent, and fails as an ordinary connection", func(t *testing.T) {
+		clearProxyEnv(t)
+		t.Setenv("BASECAMP_OAUTH_PROXY_CIDRS", "198.18.0.0/15")
+		err := refresh(t)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, surfguard.ErrBlocked), "refused by the address policy: %v", err)
+		var urlErr *url.Error
+		require.ErrorAs(t, err, &urlErr)
+		assert.Equal(t, "https://198.18.0.1/authorization/token", urlErr.URL)
+	})
 }
 
 // TestRefreshLocked_RedirectStatusSurvives asserts a refused token-endpoint
